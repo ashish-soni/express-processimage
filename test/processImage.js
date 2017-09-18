@@ -1,4 +1,4 @@
-/*global describe, it, beforeEach, __dirname*/
+/*global describe, it, beforeEach, afterEach, __dirname*/
 var express = require('express'),
     fs = require('fs'),
     http = require('http'),
@@ -12,8 +12,14 @@ var express = require('express'),
 
 describe('express-processimage', function () {
     var config;
+    var sandbox;
     beforeEach(function () {
         config = { root: root, filters: {} };
+        sandbox = sinon.sandbox.create();
+    });
+
+    afterEach(function () {
+        sandbox.restore();
     });
 
     var expect = unexpected.clone()
@@ -27,12 +33,18 @@ describe('express-processimage', function () {
             return expect(
                 express()
                     .use(processImage(config))
-                    .use(express['static'](root)),
+                    .use(express.static(root)),
                 'to yield exchange', {
                     request: subject,
                     response: value
                 }
             );
+        })
+        .addAssertion('<Buffer> [when] converted to PNG <assertion>', function (expect, subject) {
+            expect.errorMode = 'bubble';
+            return sharp(subject).png().toBuffer().then(function (pngBuffer) {
+                return expect.shift(pngBuffer);
+            });
         });
 
     it('should not mess with request for non-image file', function () {
@@ -65,6 +77,89 @@ describe('express-processimage', function () {
     it('refuses to process an image whose dimensions exceed maxInputPixels', function () {
         config.maxInputPixels = 100000;
         return expect('GET /hugearea.png?resize=100,100', 'to yield response', 413);
+    });
+
+    describe('with the sharp engine', function () {
+        it('should resize by specifying a bounding box', function () {
+            return expect('GET /turtle.jpg?resize=500,1000', 'to yield response', {
+                body: expect.it('to have metadata satisfying', {
+                    size: {
+                        width: 500,
+                        height: 441
+                    }
+                })
+            });
+        });
+
+        it('should do an entropy-based crop', function () {
+            return expect('GET /turtle.jpg?resize=100,200&crop=entropy', 'to yield response', {
+                body: expect.it('to resemble', pathModule.resolve(__dirname, '..', 'testdata', 'turtleCroppedEntropy100x200.jpg'))
+                    .and('to have metadata satisfying', {
+                        size: {
+                            width: 100,
+                            height: 200
+                        }
+                    })
+            });
+        });
+
+        it('should do an attention-based crop', function () {
+            return expect('GET /turtle.jpg?resize=100,200&crop=attention', 'to yield response', {
+                body: expect.it('to resemble', pathModule.resolve(__dirname, '..', 'testdata', 'turtleCroppedAttention100x200.jpg'))
+                    .and('to have metadata satisfying', {
+                        size: {
+                            width: 100,
+                            height: 200
+                        }
+                    })
+            });
+        });
+
+        // https://github.com/papandreou/express-processimage/issues/23
+        describe('when the quality and progressiveness of the image is being adjusted', function () {
+            it('should work and not log deprecation warnings when there is no explicit conversion', function () {
+                sandbox.spy(console, 'error');
+                return expect('GET /turtle.jpg?quality=10&progressive', 'to yield response', {
+                    body: expect.it('to have metadata satisfying', {
+                        size: {
+                            width: 481,
+                            height: 424
+                        },
+                        Interlace: 'Line',
+                        Filesize: expect.it('to match', /Ki?$/).and('when passed as parameter to', parseFloat, 'to be less than', 10)
+                    })
+                })
+                .then(() => expect(console.error, 'to have no calls satisfying', () => console.error(/DeprecationWarning/)));
+            });
+
+            it('should work and not log deprecation warnings when there is an explicit conversion', function () {
+                sandbox.spy(console, 'error');
+                return expect('GET /turtle.jpg?jpeg&quality=10&progressive', 'to yield response', {
+                    body: expect.it('to have metadata satisfying', {
+                        size: {
+                            width: 481,
+                            height: 424
+                        },
+                        Interlace: 'Line',
+                        Filesize: expect.it('to match', /Ki?$/).and('when passed as parameter to', parseFloat, 'to be less than', 10)
+                    })
+                })
+                .then(() => expect(console.error, 'to have no calls satisfying', () => console.error(/DeprecationWarning/)));
+            });
+        });
+    });
+
+    describe('with the sharp engine', function () {
+        it('should resize by specifying a bounding box', function () {
+            return expect('GET /turtle.jpg?sharp&resize=500,1000', 'to yield response', {
+                body: expect.it('to have metadata satisfying', {
+                    size: {
+                        width: 500,
+                        height: 441
+                    }
+                })
+            });
+        });
     });
 
     it('should run the image through pngcrush when the pngcrush CGI param is specified', function () {
@@ -296,7 +391,7 @@ describe('express-processimage', function () {
 
     describe('with an allowOperation option', function () {
         beforeEach(function () {
-            config.allowOperation = sinon.spy(function (keyValue) {
+            config.allowOperation = sandbox.spy(function (keyValue) {
                 return keyValue !== 'png';
             }).named('allowOperation');
         });
@@ -342,7 +437,7 @@ describe('express-processimage', function () {
 
         it('should apply the sharpCache option', function () {
             config.sharpCache = 123;
-            var cacheStub = sinon.stub(sharp, 'cache');
+            var cacheStub = sandbox.stub(sharp, 'cache');
             return expect('GET /turtle.jpg?metadata', 'to yield response', {
                 body: {
                     contentType: 'image/jpeg'
@@ -351,13 +446,14 @@ describe('express-processimage', function () {
                 expect(cacheStub, 'to have calls satisfying', function () {
                     cacheStub(123);
                 });
-            }).finally(function () {
-                cacheStub.restore();
             });
         });
 
-        it('should allow retrieving the image metadata as JSON', function () {
+        it('should allow retrieving the image metadata as JSON and support conditional GET', function () {
             return expect('GET /turtle.jpg?metadata', 'to yield response', {
+                headers: {
+                    ETag: expect.it('to be a string')
+                },
                 body: {
                     contentType: 'image/jpeg',
                     filesize: 105836,
@@ -369,10 +465,49 @@ describe('express-processimage', function () {
                     hasProfile: false,
                     hasAlpha: false
                 }
+            }).then(function (context) {
+                return expect({
+                    url: 'GET /turtle.jpg?metadata',
+                    headers: {
+                        'If-None-Match': context.httpResponse.headers.get('ETag')
+                    }
+                }, 'to yield response', 304);
             });
         });
 
+        // Regression test
+        it('should not break when serving a 304 to a ?metadata request when secondGuessSourceContentType is enabled', function () {
+            config.secondGuessSourceContentType = true;
+            return expect(
+                express()
+                    .use(processImage(config))
+                    .use(function (req, res, next) {
+                        res.status(304).end();
+                    }),
+                'to yield exchange', {
+                    request: {
+                        url: 'GET /turtle.jpg?metadata',
+                        headers: {
+                            'If-None-Match': '"foobar"'
+                        }
+                    },
+                    response: 304
+                }
+            );
+        });
+
         it('should allow retrieving the metadata of a non-image file with a non-image extension', function () {
+            return expect('GET /something.txt?metadata', 'to yield response', {
+                body: {
+                    contentType: 'text/plain; charset=UTF-8',
+                    filesize: 4,
+                    etag: expect.it('to be a string')
+                }
+            });
+        });
+
+        it('should allow retrieving the metadata of a non-image file with a non-image extension, even when unlisted in allowedImageSourceContentTypes', function () {
+            config.allowedImageSourceContentTypes = ['image/png'];
             return expect('GET /something.txt?metadata', 'to yield response', {
                 body: {
                     contentType: 'text/plain; charset=UTF-8',
@@ -566,7 +701,7 @@ describe('express-processimage', function () {
                 body: expect.it('to have metadata satisfying', {
                     size: {
                         width: 100,
-                        height: 100
+                        height: 88
                     },
                     Interlace: 'Line'
                 })
@@ -590,7 +725,7 @@ describe('express-processimage', function () {
             express()
                 .use(require('compression')())
                 .use(processImage())
-                .use(express['static'](root)),
+                .use(express.static(root)),
             'to yield exchange', {
                 request: 'GET /the-villa-facade.png?sourceContentType=image%2Fpng&ignoreAspectRatio&resize=652,435&extract=315,10,280,420',
                 response: {
@@ -739,7 +874,7 @@ describe('express-processimage', function () {
                                 height: 48
                             }
                         })
-                        .and('to resemble', pathModule.resolve(__dirname, '..', 'testdata', 'rotatedBulb.gif'))
+                        .and('when converted to PNG to resemble', pathModule.resolve(__dirname, '..', 'testdata', 'rotatedBulb.png'))
                     });
                 });
 
@@ -756,7 +891,7 @@ describe('express-processimage', function () {
                             },
                             Interlace: 'Line'
                         })
-                        .and('to resemble', pathModule.resolve(__dirname, '..', 'testdata', 'rotatedBulb.gif'))
+                        .and('when converted to PNG to resemble', pathModule.resolve(__dirname, '..', 'testdata', 'rotatedBulb.png'))
                     });
                 });
             });
@@ -816,7 +951,7 @@ describe('express-processimage', function () {
                                         callback(null, chunk);
                                     }, 1000);
                                 };
-                                stream.destroy = sinon.spy().named('destroy');
+                                stream.destroy = sandbox.spy().named('destroy');
                                 createdStreams.push(stream);
                                 setTimeout(run(function () {
                                     request.abort();
@@ -828,7 +963,7 @@ describe('express-processimage', function () {
                 };
                 var server = express()
                     .use(processImage(config))
-                    .use(express['static'](root))
+                    .use(express.static(root))
                     .listen(0);
 
                 var serverAddress = server.address();
@@ -871,7 +1006,7 @@ describe('express-processimage', function () {
                 },
                 body: expect.it('to have metadata satisfying', {
                     format: 'PNG',
-                    size: { width: 40, height: 35 }
+                    size: { width: 40, height: 17 }
                 })
             });
         });
@@ -906,7 +1041,7 @@ describe('express-processimage', function () {
     it('should send an error response when an out-of-bounds extract operation is requested', function () {
         var server = express()
             .use(processImage(config))
-            .use(express['static'](root))
+            .use(express.static(root))
             .listen(0);
 
         var serverAddress = server.address();
@@ -956,5 +1091,22 @@ describe('express-processimage', function () {
                 response: 200
             }
         );
+    });
+
+    describe('with a allowedImageSourceContentTypes setting', function () {
+        it('should refuse to process a non-whitelisted image', function () {
+            config.allowedImageSourceContentTypes = ['image/png'];
+            return expect('GET /turtle.jpg?resize=100,100&png', 'to yield response', {
+                headers: {
+                    'Content-Type': 'image/jpeg'
+                },
+                body: expect.it('to have metadata satisfying', {
+                    size: {
+                        width: 481,
+                        height: 424
+                    }
+                })
+            });
+        });
     });
 });
